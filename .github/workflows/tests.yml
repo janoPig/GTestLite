@@ -1,0 +1,63 @@
+name: GTestLite CI
+
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build on Linux
+        if: runner.os == 'Linux'
+        run: g++ -std=c++17 -I. test/test.cpp -o runner
+
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build on Windows
+        if: runner.os == 'Windows'
+        run: cl /EHsc /std:c++17 /I. test/test.cpp /Fe:runner.exe
+
+      - name: List tests
+        run: ${{ runner.os == 'Linux' && './runner --gtest_list_tests' || '.\runner.exe --gtest_list_tests' }}
+
+      - name: Run all PASSING tests
+        run: ${{ runner.os == 'Linux' && './runner --gtest_filter=RelationalTest' || '.\runner.exe --gtest_filter=RelationalTest' }}
+        continue-on-error: false
+
+      - name: Run with filter
+        run: ${{ runner.os == 'Linux' && './runner --gtest_filter=RelationalTest' || '.\runner.exe --gtest_filter=RelationalTest' }}
+
+      - name: Run with repeat
+        run: ${{ runner.os == 'Linux' && './runner --gtest_filter=ComprehensiveTest --gtest_repeat=2' || '.\runner.exe --gtest_filter=ComprehensiveTest --gtest_repeat=2' }}
+
+      - name: Run fixtures
+        run: ${{ runner.os == 'Linux' && './runner --gtest_filter=MathFixture' || '.\runner.exe --gtest_filter=MathFixture' }}
+
+      - name: Generate XML report
+        run: ${{ runner.os == 'Linux' && './runner --gtest_filter=ComprehensiveTest --gtest_output=xml:report.xml' || '.\runner.exe --gtest_filter=ComprehensiveTest --gtest_output=xml:report.xml' }}
+
+      - name: Test negative cases on Linux (expect failure)
+        if: runner.os == 'Linux'
+        run: '! ./runner --gtest_filter=NegativeTest'
+
+      - name: Test negative cases on Windows (expect failure)
+        if: runner.os == 'Windows'
+        run: powershell -Command "& '.\runner.exe' --gtest_filter=NegativeTest; if (`$LASTEXITCODE -eq 0) { exit 1 } else { exit 0 }"
+
+      - name: Archive reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-${{ matrix.os }}
+          path: report.xml
+          if-no-files-found: ignore
+
