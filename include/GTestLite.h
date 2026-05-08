@@ -16,6 +16,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -27,6 +30,20 @@ namespace GTestLite {
 #define CLR_RST "\033[0m"
 
     struct Failure { std::string file; int line; std::string message; };
+
+    inline std::vector<Failure>& GetGlobalFailures() {
+        static std::vector<Failure> global_failures;
+        return global_failures;
+    }
+
+    inline thread_local std::vector<Failure>* g_current_test_failures = nullptr;
+
+    inline std::vector<Failure>* GetActiveFailureVector() {
+        if (g_current_test_failures != nullptr) {
+            return g_current_test_failures;
+        }
+        return &GetGlobalFailures();
+    }
 
     struct TestResult {
         std::string suite;
@@ -64,7 +81,7 @@ namespace GTestLite {
     inline std::vector<Registry>& get_reg() { static std::vector<Registry> r; return r; }
 
     inline std::string to_lower(std::string s) {
-        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
         return s;
     }
 
@@ -74,6 +91,43 @@ namespace GTestLite {
         else if (micros < 1000000) oss << (micros / 1000.0) << " ms";
         else oss << (micros / 1000000.0) << " s";
         return oss.str();
+    }
+
+    template <typename T, typename = void>
+    struct has_to_string : std::false_type {};
+
+    template <typename T>
+    struct has_to_string<T, std::void_t<decltype(std::to_string(std::declval<T>()))>> : std::true_type {};
+
+    template <typename T, typename = void>
+    struct has_dump : std::false_type {};
+
+    template <typename T>
+    struct has_dump<T, std::void_t<decltype(std::declval<T>().Dump())>> : std::true_type {};
+
+    template<typename T>
+    std::string to_printable(const T& val)
+    {
+        if constexpr (std::is_convertible_v<T, std::string>)
+        {
+            return std::string(val);
+        }
+        else if constexpr (std::is_enum_v<T>)
+        {
+            return std::to_string(static_cast<long long>(val));
+        }
+        else if constexpr (has_to_string<T>::value)
+        {
+            return std::to_string(val);
+        }
+        else if constexpr (has_dump<T>::value)
+        {
+            return val.Dump();
+        }
+        else
+        {
+            return "object";
+        }
     }
 
     inline int RunAllTests(int argc, char** argv) {
@@ -112,6 +166,8 @@ namespace GTestLite {
 
                 std::cout << CLR_GRN << "[ RUN      ] " << CLR_RST << full_name << "\n";
                 auto inst = t.factory();
+                g_current_test_failures = &inst->failures;
+
                 auto start = std::chrono::high_resolution_clock::now();
                 try {
                     inst->SetUp(); inst->Run(); inst->TearDown();
@@ -124,6 +180,8 @@ namespace GTestLite {
                     inst->failures.push_back({ __FILE__, __LINE__, "Unknown exception" });
                 }
                 auto end = std::chrono::high_resolution_clock::now();
+                g_current_test_failures = nullptr;
+
                 long long diff = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
                 results.push_back({ t.s, t.n, diff, inst->failures });
@@ -172,9 +230,10 @@ namespace GTestLite {
     static inline int reg_##f##_##n = [](){ GTestLite::get_reg().push_back({#f, #n, [](){return std::make_unique<f##_##n##_T>();}}); return 0; }(); \
     void f##_##n##_T::Run()
 
+
 #define GTEST_LITE_CHECK(a, b, op, fatal) \
-    if (!((a) op (b))) GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, \
-        "Value of: " #a " " #op " " #b "\n    Actual: " + std::to_string(a) + " vs " + std::to_string(b), fatal)
+    if (!((a) op (b))) GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, \
+        "Value of: " #a " " #op " " #b "\n    Actual: " + GTestLite::to_printable(a) + " vs " + GTestLite::to_printable(b), fatal)
 
 #define EXPECT_EQ(a,b) GTEST_LITE_CHECK(a,b, ==, false)
 #define ASSERT_EQ(a,b) GTEST_LITE_CHECK(a,b, ==, true)
@@ -189,23 +248,23 @@ namespace GTestLite {
 #define EXPECT_GE(a,b) GTEST_LITE_CHECK(a,b, >=, false)
 #define ASSERT_GE(a,b) GTEST_LITE_CHECK(a,b, >=, true)
 
-#define EXPECT_TRUE(c)  if(!(c)) GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Expected true: " #c, false)
-#define ASSERT_TRUE(c)  if(!(c)) GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Expected true: " #c, true)
-#define EXPECT_FALSE(c) if((c))  GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Expected false: " #c, false)
-#define ASSERT_FALSE(c) if((c))  GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Expected false: " #c, true)
+#define EXPECT_TRUE(c)  if(!(c)) GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Expected true: " #c, false)
+#define ASSERT_TRUE(c)  if(!(c)) GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Expected true: " #c, true)
+#define EXPECT_FALSE(c) if((c))  GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Expected false: " #c, false)
+#define ASSERT_FALSE(c) if((c))  GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Expected false: " #c, true)
 
-#define EXPECT_STREQ(a,b)     { std::string s1=(a?a:""), s2=(b?b:""); if(s1!=s2) GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Expected: " + s1 + " == " + s2, false); }
-#define ASSERT_STREQ(a,b)     { std::string s1=(a?a:""), s2=(b?b:""); if(s1!=s2) GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Expected: " + s1 + " == " + s2, true); }
-#define EXPECT_STRCASEEQ(a,b) { if(GTestLite::to_lower(a?a:"") != GTestLite::to_lower(b?b:"")) GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Case-insensitive match failed", false); }
-#define ASSERT_STRCASEEQ(a,b) { if(GTestLite::to_lower(a?a:"") != GTestLite::to_lower(b?b:"")) GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Case-insensitive match failed", true); }
+#define EXPECT_STREQ(a,b)     { std::string s1=(a?a:""), s2=(b?b:""); if(s1!=s2) GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Expected: " + s1 + " == " + s2, false); }
+#define ASSERT_STREQ(a,b)     { std::string s1=(a?a:""), s2=(b?b:""); if(s1!=s2) GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Expected: " + s1 + " == " + s2, true); }
+#define EXPECT_STRCASEEQ(a,b) { if(GTestLite::to_lower(a?a:"") != GTestLite::to_lower(b?b:"")) GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Case-insensitive match failed", false); }
+#define ASSERT_STRCASEEQ(a,b) { if(GTestLite::to_lower(a?a:"") != GTestLite::to_lower(b?b:"")) GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Case-insensitive match failed", true); }
 
-#define EXPECT_THROW(stmt, ex) try { stmt; GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "No exception thrown", false); } catch(const ex&){} catch(...){ GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Wrong exception type", false); }
-#define ASSERT_THROW(stmt, ex) try { stmt; GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "No exception thrown", true); } catch(const ex&){} catch(...){ GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Wrong exception type", true); }
-#define EXPECT_NO_THROW(stmt)  try { stmt; } catch(...){ GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Unexpected exception thrown", false); }
-#define ASSERT_NO_THROW(stmt)  try { stmt; } catch(...){ GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Unexpected exception thrown", true); }
+#define EXPECT_THROW(stmt, ex) try { stmt; GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "No exception thrown", false); } catch(const ex&){} catch(...){ GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Wrong exception type", false); }
+#define ASSERT_THROW(stmt, ex) try { stmt; GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "No exception thrown", true); } catch(const ex&){} catch(...){ GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Wrong exception type", true); }
+#define EXPECT_NO_THROW(stmt)  try { stmt; } catch(...){ GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Unexpected exception thrown", false); }
+#define ASSERT_NO_THROW(stmt)  try { stmt; } catch(...){ GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Unexpected exception thrown", true); }
 
-#define EXPECT_NEAR(a,b,e)    if(std::abs((a)-(b)) > (e)) GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Near check failed", false)
-#define ASSERT_NEAR(a,b,e)    if(std::abs((a)-(b)) > (e)) GTestLite::MessageProxy(&this->failures, __FILE__, __LINE__, "Near check failed", true)
+#define EXPECT_NEAR(a,b,e)    if(std::abs((a)-(b)) > (e)) GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Near check failed", false)
+#define ASSERT_NEAR(a,b,e)    if(std::abs((a)-(b)) > (e)) GTestLite::MessageProxy(GTestLite::GetActiveFailureVector(), __FILE__, __LINE__, "Near check failed", true)
 #define EXPECT_DOUBLE_EQ(a,b) EXPECT_NEAR(a,b, 1e-9)
 #define ASSERT_DOUBLE_EQ(a,b) ASSERT_NEAR(a,b, 1e-9)
 
